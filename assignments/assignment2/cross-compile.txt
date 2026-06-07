@@ -1,0 +1,4 @@
+Using built-in specs.
+COLLECT_GCC=aarch64-none-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/usr/bin/../libexec/gcc/aarch64-none-linux-gnu/15.2.1/lto-wrapper
+/usr/bin/../aarch64-none-linux-gnu/libc
