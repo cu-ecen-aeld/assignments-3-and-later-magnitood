@@ -158,7 +158,7 @@ int daemonize()
 int main(int argc, char *argv[])
 {
     int ret = 0;
-    if (argc == 2) {//&& strncmp(argv[1], "-d", 2)) {
+    if (argc == 2 && strncmp(argv[1], "-d", 2) == 0) {//&& strncmp(argv[1], "-d", 2)) {
         printf("Daemonizing\n");
         ret = daemonize();
     } else {
