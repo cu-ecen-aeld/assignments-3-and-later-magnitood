@@ -12,10 +12,135 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
+
+#define NOB_IMPLEMENTATION
+#include "nob.h"
+
+#define DEFAULT_BUF_SIZE 4 * 4096
+#define ARR_SIZE(arr) (sizeof(arr)/sizeof(*arr))
 
 bool signal_recieved = false;
 
-#define UNUSED(x) (void)x
+typedef struct Thread_Info {
+    FILE *writefile;
+    pthread_mutex_t *mutex; // mutex to lock the writing file
+    int cfd;
+    char *addr;
+} Thread_Info;
+
+typedef struct Thread_Ids {
+    pthread_t *items;
+    size_t count;
+    size_t capacity;
+} Thread_Ids;
+
+void write_and_flush_file(const void *restrict buf, size_t size, size_t n, FILE *restrict file)
+{
+    fwrite(buf, size, n, file);
+    fflush(file);
+    // int fd = fileno(file);
+    // write(fd, buf, n);
+}
+
+bool send_file_to_client(int sockfd, FILE *in_file)
+{
+    int infd = fileno(in_file);
+    off_t read_offset = 0;
+
+    struct stat st = {0};
+    if (fstat(infd, &st) != 0) {
+        syslog(LOG_USER | LOG_ERR, "fstat failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    // syslog(LOG_USER | LOG_ERR, "Sending file of size: %zu\n", st.st_size);
+    if (sendfile(sockfd, infd, &read_offset, st.st_size) == -1) {
+        syslog(LOG_USER | LOG_ERR, "sendfile failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+void *handle_connection(void *ptr)
+{
+    void *ret = NULL;
+    Thread_Info *p = (Thread_Info *) ptr;
+    int cfd = p->cfd;
+    // p->writefile;
+
+    size_t bufsize = DEFAULT_BUF_SIZE;
+    unsigned char *buf = malloc(sizeof(*buf) * bufsize);
+    if (buf == NULL) goto cleanup_malloc;
+
+    for (;;) {
+        ssize_t bytes_recvd = recv(cfd, buf, bufsize, 0);
+        if (bytes_recvd == -1) { perror("recv"); goto cleanup_malloc; }
+        if (bytes_recvd == 0) break;
+
+        bool newline_present = false;
+        ssize_t i;
+        for (i = 0; i < bytes_recvd; i++) {
+            if (buf[i] == '\n') {
+                newline_present = true;
+                break;
+            }
+        }
+
+        pthread_mutex_lock(p->mutex);
+        if (newline_present) {
+            write_and_flush_file(buf, 1, i+1, p->writefile);
+            if (!send_file_to_client(cfd, p->writefile)) {
+                pthread_mutex_unlock(p->mutex);
+                goto cleanup_malloc;
+            };
+            write_and_flush_file(buf+i+1, 1, bytes_recvd - (i+1), p->writefile);
+        } else {
+            write_and_flush_file(buf, 1, bytes_recvd, p->writefile);
+        }
+        pthread_mutex_unlock(p->mutex);
+    }
+    ret = ptr;
+
+cleanup_malloc:
+    if (buf != NULL) free(buf);
+    close(cfd);
+    syslog(LOG_USER | LOG_INFO , "Closed connection from %s\n", p->addr);
+    if (p->addr != NULL) free(p->addr);
+    free(p);
+    return ret;
+}
+
+void *append_timer(void *ptr)
+{
+    Thread_Info *p = (Thread_Info *) ptr;
+    struct timespec ts;
+    struct tm tm;
+    char time_string[128];
+
+    while (!signal_recieved) {
+        pthread_mutex_lock(p->mutex);
+        if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+            syslog(LOG_USER | LOG_ERR, "clock_gettime failed: %s\n", strerror(errno));
+            pthread_mutex_unlock(p->mutex);
+            return NULL;
+        }
+
+        if (localtime_r(&ts.tv_sec, &tm) == NULL) {
+            syslog(LOG_USER | LOG_ERR, "trying to get localtime failed: %s\n", strerror(errno));
+            pthread_mutex_unlock(p->mutex);
+            return NULL;
+        }
+
+        size_t bytes_written = strftime(time_string, ARR_SIZE(time_string), "timestamp:%A %d %B %Y (%C-%m-%d) %T %Z\n", &tm);
+        write_and_flush_file(time_string, 1, bytes_written, p->writefile);
+        pthread_mutex_unlock(p->mutex);
+        sleep(10);
+    }
+
+    return ptr;
+}
 
 void handler(int signum)
 {
@@ -24,19 +149,27 @@ void handler(int signum)
     signal_recieved = true;
 }
 
-void send_file_to_client(int sockfd, FILE *in_file)
-{
-    int infd = fileno(in_file);
-    off_t read_offset = 0;
+bool start_signal_blocking_thread(pthread_t *tid, void *(*func)(void*), void *params) {
+    sigset_t sigmask = {0}, old_mask = {0};
+    sigaddset(&sigmask, SIGINT);
+    sigaddset(&sigmask, SIGTERM);
 
-    // find the size of the file
-    long store = ftell(in_file);
-    fseek(in_file, 0, SEEK_END);
-    long filesize = ftell(in_file);
-    fseek(in_file, store, SEEK_SET);
+    if (pthread_sigmask(SIG_SETMASK, &sigmask, &old_mask) != 0) {
+        syslog(LOG_USER | LOG_ERR, "Failed to set sigmask: %s\n", strerror(errno));
+        return false;
+    }
 
-    ssize_t bytes_send = sendfile(sockfd, infd, &read_offset, filesize);
-    if (bytes_send == -1) { perror("sendfile"); exit(EXIT_FAILURE); };
+    if (pthread_create(tid, NULL, func, params) != 0) {
+        syslog(LOG_USER | LOG_ERR, "Failed to create thread: %s\n", strerror(errno));
+        return false;
+    }
+
+    if (pthread_sigmask(SIG_SETMASK, &old_mask, NULL) != 0) {
+        syslog(LOG_USER | LOG_ERR, "Failed to set sigmask: %s\n", strerror(errno));
+        return false;
+    }
+
+    return true;
 }
 
 int run()
@@ -51,7 +184,7 @@ int run()
     sigaction(SIGTERM, &sa, NULL);
 
     // scratch buffer
-    size_t bufsize = 4 * 4096; // 4 pages
+    size_t bufsize = DEFAULT_BUF_SIZE; // 4 pages
     char *buf = malloc(sizeof(*buf) * bufsize);
 
     const char *path = "/var/tmp/aesdsocketdata";
@@ -75,10 +208,24 @@ int run()
     ret = listen(fd, SOMAXCONN);
     if (ret == -1) { perror("listen"); return 1; }
 
-    struct sockaddr_in client_addr = {0};
-    socklen_t client_addr_size = 0;
+    Thread_Ids thread_ids = {0};
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_init(&mutex, NULL);
+
+    pthread_t timer_tid;
+    Thread_Info timer_info = {
+        .writefile = writefile,
+        .mutex = &mutex,
+    };
+    if (!start_signal_blocking_thread(&timer_tid, append_timer, &timer_info)) {
+        syslog(LOG_USER | LOG_ERR, "Starting timer thread failed\n");
+        return 1;
+    }
 
     while (!signal_recieved) {
+        struct sockaddr_in client_addr = {0};
+        socklen_t client_addr_size = 0;
+
         int cfd = accept(fd, (struct sockaddr *) &client_addr, &client_addr_size);
         if (cfd == -1 && errno == EINTR) break;
 
@@ -86,37 +233,29 @@ int run()
         inet_ntop(AF_INET, &client_addr.sin_addr, addr_ascii, sizeof(addr_ascii));
         syslog(LOG_USER | LOG_INFO , "Accepted connection from %s\n", addr_ascii);
 
-        for (;;) {
-            ssize_t bytes_recvd = recv(cfd, buf, bufsize, 0);
-            if (bytes_recvd == -1) { perror("recv"); return 1; }
-            if (bytes_recvd == 0) break;
+        pthread_t tid;
+        Thread_Info *info = malloc(sizeof(*info));
+        info->cfd = cfd;
+        info->writefile = writefile;
+        info->mutex = &mutex;
+        info->addr = strdup(addr_ascii);
 
-            bool newline_present = false;
-            ssize_t i;
-            for (i = 0; i < bytes_recvd; i++) {
-                if (buf[i] == '\n') {
-                    newline_present = true;
-                    break;
-                }
-            }
-
-            if (newline_present) {
-                fwrite(buf, 1, i+1, writefile);
-                send_file_to_client(cfd, writefile);
-                fwrite(buf+i+1, 1, bytes_recvd - (i+1), writefile);
-            } else {
-                fwrite(buf, 1, bytes_recvd, writefile);
-            }
+        if (!start_signal_blocking_thread(&tid, handle_connection, info)) {
+            syslog(LOG_USER | LOG_ERR, "Starting thread failed\n");
+            break;
         }
 
-        syslog(LOG_USER | LOG_INFO , "Closed connection from %s\n", addr_ascii);
-        close(cfd);
+        da_append(&thread_ids, tid);
     }
+
+    for (size_t i = 0; i < thread_ids.count; i++)
+        pthread_join(thread_ids.items[i], NULL);
 
     fclose(writefile);
     close(fd);
     remove(path);
     free(buf);
+    da_free(thread_ids);
 
     return 0;
 
