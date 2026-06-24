@@ -1,8 +1,8 @@
 .PHONY: all clean
 
-CC=$(CROSS_COMPILE)cc
-CFLAGS=-Wall -Wextra
-LDFLAGS=-lpthread
+CC ?= $(CROSS_COMPILE)cc
+CFLAGS ?= -Wall -Wextra
+LDFLAGS ?= -lpthread
 
 all: aesdsocket
 
