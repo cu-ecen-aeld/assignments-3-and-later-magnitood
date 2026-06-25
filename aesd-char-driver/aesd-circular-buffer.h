@@ -18,7 +18,7 @@
 
 #define AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED 10
 
-struct aesd_buffer_entry
+typedef struct aesd_buffer_entry
 {
     /**
      * A location where the buffer contents in buffptr are stored
@@ -28,14 +28,14 @@ struct aesd_buffer_entry
      * Number of bytes stored in buffptr
      */
     size_t size;
-};
+} Entry;
 
-struct aesd_circular_buffer
+typedef struct aesd_circular_buffer
 {
     /**
      * An array of pointers to memory allocated for the most recent write operations
      */
-    struct aesd_buffer_entry  entry[AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED];
+    Entry entries[AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED];
     /**
      * The current location in the entry structure where the next write should
      * be stored.
@@ -49,14 +49,14 @@ struct aesd_circular_buffer
      * set to true when the buffer entry structure is full
      */
     bool full;
-};
+} Ring_Buffer;
 
-extern struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
+extern Entry *aesd_circular_buffer_find_entry_offset_for_fpos(Ring_Buffer *buffer,
             size_t char_offset, size_t *entry_offset_byte_rtn );
 
-extern void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry);
+extern void aesd_circular_buffer_add_entry(Ring_Buffer *buffer, const Entry *add_entry);
 
-extern void aesd_circular_buffer_init(struct aesd_circular_buffer *buffer);
+extern void aesd_circular_buffer_init(Ring_Buffer *buffer);
 
 /**
  * Create a for loop to iterate over each member of the circular buffer.
@@ -73,9 +73,9 @@ extern void aesd_circular_buffer_init(struct aesd_circular_buffer *buffer);
  * }
  */
 #define AESD_CIRCULAR_BUFFER_FOREACH(entryptr,buffer,index) \
-    for(index=0, entryptr=&((buffer)->entry[index]); \
+    for(index=0, entryptr=&((buffer)->entries[index]); \
             index<AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; \
-            index++, entryptr=&((buffer)->entry[index]))
+            index++, entryptr=&((buffer)->entries[index]))
 
 
 
