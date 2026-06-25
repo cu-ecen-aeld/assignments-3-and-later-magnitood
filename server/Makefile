@@ -1,6 +1,6 @@
 .PHONY: all clean
 
-CC ?= $(CROSS_COMPILE)cc
+CC ?= $(CROSS_COMPILE)$(CC)
 CFLAGS ?= -Wall -Wextra
 LDFLAGS ?= -lpthread
 
