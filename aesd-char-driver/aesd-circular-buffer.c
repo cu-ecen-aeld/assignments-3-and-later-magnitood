@@ -68,6 +68,8 @@ void aesd_circular_buffer_add_entry(Ring_Buffer *buffer, const Entry *add_entry)
 
     if (buffer->in_offs == buffer->out_offs)
         buffer->full = true;
+    else
+        buffer->full = false;
 }
 
 /**
