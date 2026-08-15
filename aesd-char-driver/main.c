@@ -72,12 +72,14 @@ ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count,
     unsigned char *kbuf = NULL;
     size_t i = 0;
     struct aesd_instance_data *instance_data = NULL;
-    Entry *old_entry;
+    struct aesd_circular_buffer *ring_buffer;
+    Entry *pending_entry;
 
     PDEBUG("write %zu bytes with offset %lld\n", count, *f_pos);
 
     instance_data = (struct aesd_instance_data *) filp->private_data;
-    old_entry = &instance_data->entry_to_be_commited;
+    pending_entry = &instance_data->entry_to_be_commited;
+    ring_buffer = &instance_data->aesd_dev->ring_buffer;
 
     kbuf = kzalloc(count, GFP_KERNEL);
     if (kbuf == NULL) return -ENOBUFS;
@@ -97,30 +99,31 @@ ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count,
     }
     retval = i+1;
 
-    if (old_entry->buffptr != NULL) { // old entry exists
-        unsigned char *new_buf = krealloc(old_entry->buffptr, old_entry->size + i+1, GFP_KERNEL);
+    if (pending_entry->buffptr != NULL) { // pending entry exists
+        unsigned char *new_buf = krealloc(pending_entry->buffptr, pending_entry->size + i+1, GFP_KERNEL);
         if (new_buf == NULL) {
             retval = -ENOBUFS;
             goto cleanup;
         }
 
-        memcpy(new_buf+old_entry->size, kbuf, i+1);
+        memcpy(new_buf+pending_entry->size, kbuf, i+1);
 
         if (newline_found) {
             Entry e = {
                 .buffptr = new_buf,
-                .size = old_entry->size + i+1,
+                .size = pending_entry->size + i+1,
             };
 
             mutex_lock(&instance_data->aesd_dev->mutex);
-            aesd_circular_buffer_add_entry(&instance_data->aesd_dev->ring_buffer, &e);
+            kfree(ring_buffer->entries[ring_buffer->in_offs].buffptr);
+            aesd_circular_buffer_add_entry(ring_buffer, &e);
             mutex_unlock(&instance_data->aesd_dev->mutex);
 
-            old_entry->buffptr = NULL;
-            old_entry->size = 0;
+            pending_entry->buffptr = NULL;
+            pending_entry->size = 0;
         } else {
-            old_entry->buffptr = new_buf;
-            old_entry->size += i+1;
+            pending_entry->buffptr = new_buf;
+            pending_entry->size += i+1;
         }
     } else {
         if (newline_found) {
@@ -130,11 +133,12 @@ ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count,
             };
 
             mutex_lock(&instance_data->aesd_dev->mutex);
-            aesd_circular_buffer_add_entry(&instance_data->aesd_dev->ring_buffer, &e);
+            kfree(ring_buffer->entries[ring_buffer->in_offs].buffptr);
+            aesd_circular_buffer_add_entry(ring_buffer, &e);
             mutex_unlock(&instance_data->aesd_dev->mutex);
         } else {
-            old_entry->buffptr = kbuf;
-            old_entry->size = i+1;
+            pending_entry->buffptr = kbuf;
+            pending_entry->size = i+1;
         }
         kbuf = NULL;
     }
@@ -143,6 +147,7 @@ cleanup:
     if (kbuf != NULL) kfree(kbuf);
     return retval;
 }
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
