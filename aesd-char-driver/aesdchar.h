@@ -32,15 +32,12 @@ struct aesd_dev
      * TODO: Add structure(s) and locks needed to complete assignment requirements
      */
 
+
+    struct aesd_buffer_entry entry_to_be_commited;
+
     struct mutex mutex; // to synchronize the ring buffer
     struct aesd_circular_buffer ring_buffer;
     struct cdev cdev;     /* Char device structure      */
-};
-
-struct aesd_instance_data
-{
-    struct aesd_buffer_entry entry_to_be_commited;
-    struct aesd_dev *aesd_dev;
 };
 
 
