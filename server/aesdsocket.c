@@ -6,6 +6,7 @@
 #include <string.h>
 #include <assert.h>
 
+#include <sys/syslog.h>
 #include <unistd.h>
 #include <syslog.h>
 #include <arpa/inet.h>
@@ -20,13 +21,16 @@
 #define DEFAULT_BUF_SIZE 4 * 4096
 #define ARR_SIZE(arr) (sizeof(arr)/sizeof(*arr))
 
+#define USE_AESD_CHAR_DEVICE
+
 bool signal_recieved = false;
 
 typedef struct Thread_Info {
     FILE *writefile;
+    char *writefile_path;
     pthread_mutex_t *mutex; // mutex to lock the writing file
-    int cfd;
     char *addr;
+    int cfd;
 } Thread_Info;
 
 typedef struct Thread_Ids {
@@ -43,8 +47,35 @@ void write_and_flush_file(const void *restrict buf, size_t size, size_t n, FILE 
     // write(fd, buf, n);
 }
 
-bool send_file_to_client(int sockfd, FILE *in_file)
+bool send_file_to_client(int sockfd, const char *filepath)
 {
+    FILE *in_file = fopen(filepath, "r");
+    if (in_file == NULL) {
+        syslog(LOG_USER | LOG_ERR, "fopen failed: %s\n", strerror(errno));
+        return false;
+    }
+
+#ifdef USE_AESD_CHAR_DEVICE
+    unsigned char buf[4096]; // TODO: make this buffer page aligned
+
+    int read_offset = 0;
+    while (true) {
+        ssize_t bytes_read = pread(fileno(in_file), buf, sizeof(buf), read_offset);
+        if (bytes_read == -1) {
+            syslog(LOG_USER | LOG_ERR, "read failed: %s\n", strerror(errno));
+            break;
+        }
+        if (bytes_read == 0) break;
+
+        read_offset += bytes_read;
+
+        ssize_t bytes_sent = send(sockfd, buf, bytes_read, 0);
+        if (bytes_sent == -1) {
+            syslog(LOG_USER | LOG_ERR, "send failed: %s\n", strerror(errno));
+            break;
+        }
+    }
+#else
     int infd = fileno(in_file);
     off_t read_offset = 0;
 
@@ -54,12 +85,14 @@ bool send_file_to_client(int sockfd, FILE *in_file)
         return false;
     }
 
-    // syslog(LOG_USER | LOG_ERR, "Sending file of size: %zu\n", st.st_size);
+    syslog(LOG_USER | LOG_DEBUG, "Sending file of size: %zu\n", st.st_size);
     if (sendfile(sockfd, infd, &read_offset, st.st_size) == -1) {
         syslog(LOG_USER | LOG_ERR, "sendfile failed: %s\n", strerror(errno));
         return false;
     }
+#endif // USE_AESD_CHAR_DEVICE
 
+    fclose(in_file);
     return true;
 }
 
@@ -91,7 +124,7 @@ void *handle_connection(void *ptr)
         pthread_mutex_lock(p->mutex);
         if (newline_present) {
             write_and_flush_file(buf, 1, i+1, p->writefile);
-            if (!send_file_to_client(cfd, p->writefile)) {
+            if (!send_file_to_client(cfd, p->writefile_path)) {
                 pthread_mutex_unlock(p->mutex);
                 goto cleanup_malloc;
             };
@@ -107,7 +140,8 @@ cleanup_malloc:
     if (buf != NULL) free(buf);
     close(cfd);
     syslog(LOG_USER | LOG_INFO , "Closed connection from %s\n", p->addr);
-    if (p->addr != NULL) free(p->addr);
+    free(p->addr);
+    free(p->writefile_path);
     free(p);
     return ret;
 }
@@ -187,8 +221,13 @@ int run()
     size_t bufsize = DEFAULT_BUF_SIZE; // 4 pages
     char *buf = malloc(sizeof(*buf) * bufsize);
 
+#ifdef USE_AESD_CHAR_DEVICE
+    const char *path = "/dev/aesdchar";
+#else
     const char *path = "/var/tmp/aesdsocketdata";
-    FILE *writefile = fopen(path, "w+");
+#endif // USE_AESD_CHAR_DEVICE
+
+    FILE *writefile = fopen(path, "r+");
     if (writefile == NULL) { perror("fopen"); return 1; }
 
     // since the lifetime of all the objects in this program is the entire program,
@@ -212,6 +251,7 @@ int run()
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_init(&mutex, NULL);
 
+#ifndef USE_AESD_CHAR_DEVICE
     pthread_t timer_tid;
     Thread_Info timer_info = {
         .writefile = writefile,
@@ -221,6 +261,7 @@ int run()
         syslog(LOG_USER | LOG_ERR, "Starting timer thread failed\n");
         return 1;
     }
+#endif // USE_AESD_CHAR_DEVICE
 
     while (!signal_recieved) {
         struct sockaddr_in client_addr = {0};
@@ -239,6 +280,16 @@ int run()
         info->writefile = writefile;
         info->mutex = &mutex;
         info->addr = strdup(addr_ascii);
+        if (info->addr == NULL) {
+            syslog(LOG_USER | LOG_ERR, "strdup failed: %s\n", strerror(errno));
+            break;
+        }
+
+        info->writefile_path = strdup(path);
+        if (info->writefile_path == NULL) {
+            syslog(LOG_USER | LOG_ERR, "strdup failed: %s\n", strerror(errno));
+            break;
+        }
 
         if (!start_signal_blocking_thread(&tid, handle_connection, info)) {
             syslog(LOG_USER | LOG_ERR, "Starting thread failed\n");
@@ -251,9 +302,11 @@ int run()
     for (size_t i = 0; i < thread_ids.count; i++)
         pthread_join(thread_ids.items[i], NULL);
 
-    fclose(writefile);
     close(fd);
+    fclose(writefile);
+#ifndef USE_AESD_CHAR_DEVICE
     remove(path);
+#endif // USE_AESD_CHAR_DEVICE
     free(buf);
     da_free(thread_ids);
 
