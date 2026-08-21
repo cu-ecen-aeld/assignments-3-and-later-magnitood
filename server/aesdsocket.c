@@ -26,7 +26,6 @@
 bool signal_recieved = false;
 
 typedef struct Thread_Info {
-    FILE *writefile;
     char *writefile_path;
     pthread_mutex_t *mutex; // mutex to lock the writing file
     char *addr;
@@ -103,6 +102,12 @@ void *handle_connection(void *ptr)
     int cfd = p->cfd;
     // p->writefile;
 
+    FILE *writefile = fopen(p->writefile_path, "w");
+    if (writefile == NULL) {
+        syslog(LOG_USER | LOG_ERR, "fopen failed: %s\n", strerror(errno));
+        goto cleanup_file;
+    }
+
     size_t bufsize = DEFAULT_BUF_SIZE;
     unsigned char *buf = malloc(sizeof(*buf) * bufsize);
     if (buf == NULL) goto cleanup_malloc;
@@ -123,14 +128,14 @@ void *handle_connection(void *ptr)
 
         pthread_mutex_lock(p->mutex);
         if (newline_present) {
-            write_and_flush_file(buf, 1, i+1, p->writefile);
+            write_and_flush_file(buf, 1, i+1, writefile);
             if (!send_file_to_client(cfd, p->writefile_path)) {
                 pthread_mutex_unlock(p->mutex);
                 goto cleanup_malloc;
             };
-            write_and_flush_file(buf+i+1, 1, bytes_recvd - (i+1), p->writefile);
+            write_and_flush_file(buf+i+1, 1, bytes_recvd - (i+1), writefile);
         } else {
-            write_and_flush_file(buf, 1, bytes_recvd, p->writefile);
+            write_and_flush_file(buf, 1, bytes_recvd, writefile);
         }
         pthread_mutex_unlock(p->mutex);
     }
@@ -143,6 +148,8 @@ cleanup_malloc:
     free(p->addr);
     free(p->writefile_path);
     free(p);
+cleanup_file:
+    fclose(writefile);
     return ret;
 }
 
@@ -152,6 +159,12 @@ void *append_timer(void *ptr)
     struct timespec ts;
     struct tm tm;
     char time_string[128];
+
+    FILE *writefile = fopen(p->writefile_path, "w");
+    if (writefile == NULL) {
+        syslog(LOG_USER | LOG_ERR, "fopen failed: %s\n", strerror(errno));
+        return NULL;
+    }
 
     while (!signal_recieved) {
         pthread_mutex_lock(p->mutex);
@@ -168,10 +181,12 @@ void *append_timer(void *ptr)
         }
 
         size_t bytes_written = strftime(time_string, ARR_SIZE(time_string), "timestamp:%A %d %B %Y (%C-%m-%d) %T %Z\n", &tm);
-        write_and_flush_file(time_string, 1, bytes_written, p->writefile);
+        write_and_flush_file(time_string, 1, bytes_written, writefile);
         pthread_mutex_unlock(p->mutex);
         sleep(10);
     }
+
+    fclose(writefile);
 
     return ptr;
 }
@@ -227,9 +242,6 @@ int run()
     const char *path = "/var/tmp/aesdsocketdata";
 #endif // USE_AESD_CHAR_DEVICE
 
-    FILE *writefile = fopen(path, "r+");
-    if (writefile == NULL) { perror("fopen"); return 1; }
-
     // since the lifetime of all the objects in this program is the entire program,
     // I am not doing cleanup like close() to simplify error handling code. The OS will cleanup for me
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -277,7 +289,6 @@ int run()
         pthread_t tid;
         Thread_Info *info = malloc(sizeof(*info));
         info->cfd = cfd;
-        info->writefile = writefile;
         info->mutex = &mutex;
         info->addr = strdup(addr_ascii);
         if (info->addr == NULL) {
@@ -303,7 +314,6 @@ int run()
         pthread_join(thread_ids.items[i], NULL);
 
     close(fd);
-    fclose(writefile);
 #ifndef USE_AESD_CHAR_DEVICE
     remove(path);
 #endif // USE_AESD_CHAR_DEVICE
