@@ -57,6 +57,9 @@ Entry *aesd_circular_buffer_find_entry_offset_for_fpos
 */
 void aesd_circular_buffer_add_entry(Ring_Buffer *buffer, const Entry *add_entry)
 {
+    buffer->size_in_bytes =  buffer->size_in_bytes - buffer->entries[buffer->in_offs].size;
+    buffer->size_in_bytes += add_entry->size;
+
     buffer->entries[buffer->in_offs] = *add_entry;
     buffer->in_offs = (buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
 

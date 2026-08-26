@@ -36,6 +36,15 @@ typedef struct aesd_circular_buffer
      * An array of pointers to memory allocated for the most recent write operations
      */
     Entry entries[AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED];
+
+    /**
+     * Total size of the buffer calculated from each of the writes
+     */
+    size_t size_in_bytes;
+    /**
+     * set to true when the buffer entry structure is full
+     */
+    bool full;
     /**
      * The current location in the entry structure where the next write should
      * be stored.
@@ -45,10 +54,6 @@ typedef struct aesd_circular_buffer
      * The first location in the entry structure to read from
      */
     uint8_t out_offs;
-    /**
-     * set to true when the buffer entry structure is full
-     */
-    bool full;
 } Ring_Buffer;
 
 extern Entry *aesd_circular_buffer_find_entry_offset_for_fpos(Ring_Buffer *buffer,
