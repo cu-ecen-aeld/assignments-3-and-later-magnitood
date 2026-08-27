@@ -60,13 +60,13 @@ int aesd_open(struct inode *inode, struct file *filp)
 {
     filp->private_data = container_of(inode->i_cdev, struct aesd_dev, cdev);
 
-    PDEBUG("file opened\n");
+    // PDEBUG("file opened\n");
     return 0;
 }
 
 int aesd_release(struct inode *inode, struct file *filp)
 {
-    PDEBUG("open file released\n");
+    // PDEBUG("open file released\n");
     return 0;
 }
 
@@ -80,7 +80,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     size_t offset_in_entry;
     size_t read;
 
-    PDEBUG("reading %zu bytes with offset %lld\n", count, *f_pos);
+    // PDEBUG("reading %zu bytes with offset %lld\n", count, *f_pos);
 
     retval = 0;
     aesd_device = (struct aesd_dev *) filp->private_data;
@@ -111,6 +111,7 @@ cleanup:
     return retval;
 }
 
+// f_pos is ignore by the driver
 ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count,
                 loff_t *f_pos)
 {
@@ -123,7 +124,7 @@ ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count,
     struct aesd_circular_buffer *ring_buffer;
     Entry *pending_entry;
 
-    PDEBUG("write %zu bytes with offset %lld\n", count, *f_pos);
+    // PDEBUG("write %zu bytes with offset %lld\n", count, *f_pos);
 
     aesd_device = (struct aesd_dev *) filp->private_data;
     pending_entry = &aesd_device->entry_to_be_commited;
@@ -194,7 +195,7 @@ ssize_t aesd_write(struct file *filp, const char __user *ubuf, size_t count,
 
     retval = packet_size;
 
-    PDEBUG("written %zu bytes with offset %lld\n", retval, *f_pos);
+    // PDEBUG("written %zu bytes with offset %lld\n", retval, *f_pos);
 cleanup:
     if (kbuf != NULL) kfree(kbuf);
     dump_ring_buffer();
@@ -245,13 +246,10 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&seek_cmd, (void __user *) arg, sizeof(seek_cmd)))
             return -EFAULT;
 
-        PDEBUG("ioctl issued: write=%d off=%d\n", seek_cmd.write_cmd, seek_cmd.write_cmd_offset);
-
         if (seek_cmd.write_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
             return -EINVAL;
 
         true_index = (buffer->out_offs + seek_cmd.write_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
-        PDEBUG("ioctl: true_index=%zu", true_index);
         if (seek_cmd.write_cmd_offset >= buffer->entries[true_index].size)
             return -EINVAL;
 
