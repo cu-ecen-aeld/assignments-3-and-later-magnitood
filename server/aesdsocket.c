@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <string.h>
 #include <assert.h>
+#include <ctype.h>
 
 #include <sys/syslog.h>
 #include <unistd.h>
@@ -18,10 +19,21 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
+#include "aesd_ioctl.h"
+
+
+#define FALLTHROUGH __attribute__((fallthrough))
+
 #define DEFAULT_BUF_SIZE 4 * 4096
 #define ARR_SIZE(arr) (sizeof(arr)/sizeof(*arr))
 
+#define infof(fmt, args...)  syslog(LOG_USER | LOG_INFO,  fmt, ## args)
+#define debugf(fmt, args...) syslog(LOG_USER | LOG_DEBUG, fmt, ## args)
+#define errorf(fmt, args...) syslog(LOG_USER | LOG_ERR,   fmt, ## args)
+
 #define USE_AESD_CHAR_DEVICE
+
+#include "packet_parser.c"
 
 bool signal_recieved = false;
 
@@ -38,60 +50,62 @@ typedef struct Thread_Ids {
     size_t capacity;
 } Thread_Ids;
 
-void write_and_flush_file(const void *restrict buf, size_t size, size_t n, FILE *restrict file)
+bool send_file_to_client(int sockfd, int infd)
 {
-    fwrite(buf, size, n, file);
-    fflush(file);
-    // int fd = fileno(file);
-    // write(fd, buf, n);
-}
-
-bool send_file_to_client(int sockfd, const char *filepath)
-{
-    FILE *in_file = fopen(filepath, "r");
-    if (in_file == NULL) {
-        syslog(LOG_USER | LOG_ERR, "fopen failed: %s\n", strerror(errno));
-        return false;
-    }
+    // FILE *in_file = fopen(filepath, "r");
+    // if (in_file == NULL) {
+    //     errorf("fopen failed: %s\n", strerror(errno));
+    //     return false;
+    // }
 
 #ifdef USE_AESD_CHAR_DEVICE
     unsigned char buf[4096]; // TODO: make this buffer page aligned
 
-    int read_offset = 0;
+    // int read_offset = 0;
     while (true) {
-        ssize_t bytes_read = pread(fileno(in_file), buf, sizeof(buf), read_offset);
+        // ssize_t bytes_read = pread(infd, buf, sizeof(buf), read_offset);
+        ssize_t bytes_read = read(infd, buf, sizeof(buf));
         if (bytes_read == -1) {
-            syslog(LOG_USER | LOG_ERR, "read failed: %s\n", strerror(errno));
-            break;
+            errorf("pread failed: %s\n", strerror(errno));
+            return false;
         }
         if (bytes_read == 0) break;
 
-        read_offset += bytes_read;
+        // read_offset += bytes_read;
 
         ssize_t bytes_sent = send(sockfd, buf, bytes_read, 0);
         if (bytes_sent == -1) {
-            syslog(LOG_USER | LOG_ERR, "send failed: %s\n", strerror(errno));
-            break;
+            errorf("send failed: %s\n", strerror(errno));
+            return false;
         }
     }
 #else
-    int infd = fileno(in_file);
     off_t read_offset = 0;
 
     struct stat st = {0};
     if (fstat(infd, &st) != 0) {
-        syslog(LOG_USER | LOG_ERR, "fstat failed: %s\n", strerror(errno));
+        errorf("fstat failed: %s\n", strerror(errno));
         return false;
     }
 
-    syslog(LOG_USER | LOG_DEBUG, "Sending file of size: %zu\n", st.st_size);
+    debugf("Sending file of size: %zu\n", st.st_size);
     if (sendfile(sockfd, infd, &read_offset, st.st_size) == -1) {
-        syslog(LOG_USER | LOG_ERR, "sendfile failed: %s\n", strerror(errno));
+        errorf("sendfile failed: %s\n", strerror(errno));
         return false;
     }
 #endif // USE_AESD_CHAR_DEVICE
 
-    fclose(in_file);
+    return true;
+}
+
+bool aesd_seek_device(int fd, struct aesd_seekto seek_cmd)
+{
+    int ret = ioctl(fd, AESDCHAR_IOCSEEKTO, &seek_cmd);
+    if (ret == -1) {
+        errorf("ioctl error: %s\n", strerror(errno));
+        return false;
+    }
+
     return true;
 }
 
@@ -99,57 +113,74 @@ void *handle_connection(void *ptr)
 {
     void *ret = NULL;
     Thread_Info *p = (Thread_Info *) ptr;
-    int cfd = p->cfd;
-    // p->writefile;
+    int client_socket = p->cfd;
 
-    FILE *writefile = fopen(p->writefile_path, "w");
-    if (writefile == NULL) {
-        syslog(LOG_USER | LOG_ERR, "fopen failed: %s\n", strerror(errno));
-        goto cleanup_file;
+    int writefd = open(p->writefile_path, O_RDWR);
+    if (writefd == -1) {
+        errorf("open failed: %s\n", strerror(errno));
+        goto cleanup_thread;
     }
 
     size_t bufsize = DEFAULT_BUF_SIZE;
-    unsigned char *buf = malloc(sizeof(*buf) * bufsize);
-    if (buf == NULL) goto cleanup_malloc;
+    char *buf = malloc(sizeof(*buf) * bufsize);
+    if (buf == NULL) goto cleanup_file;
 
     for (;;) {
-        ssize_t bytes_recvd = recv(cfd, buf, bufsize, 0);
+        // here we are assuming the entire packet is recieved within 1 recv call
+        // the default buffer size is 16 KiB and tests fit within that
+        ssize_t bytes_recvd = recv(client_socket, buf, bufsize, 0);
         if (bytes_recvd == -1) { perror("recv"); goto cleanup_malloc; }
         if (bytes_recvd == 0) break;
 
-        bool newline_present = false;
-        ssize_t i;
-        for (i = 0; i < bytes_recvd; i++) {
-            if (buf[i] == '\n') {
-                newline_present = true;
-                break;
-            }
-        }
+        Packet packet = {0};
+        parse_packet(&packet, buf, bytes_recvd);
 
         pthread_mutex_lock(p->mutex);
-        if (newline_present) {
-            write_and_flush_file(buf, 1, i+1, writefile);
-            if (!send_file_to_client(cfd, p->writefile_path)) {
+        static_assert(Packet_KIND_COUNT == 3);
+        switch (packet.kind) {
+        case Packet_SEEK_CMD:
+            infof("seeking: write=%d pos=%d\n", packet.seek_cmd.write_cmd, packet.seek_cmd.write_cmd_offset);
+            aesd_seek_device(writefd, packet.seek_cmd);
+            if (!send_file_to_client(client_socket, writefd)) {
                 pthread_mutex_unlock(p->mutex);
+                errorf("Failed to send packet to client\n");
                 goto cleanup_malloc;
             };
-            write_and_flush_file(buf+i+1, 1, bytes_recvd - (i+1), writefile);
-        } else {
-            write_and_flush_file(buf, 1, bytes_recvd, writefile);
+            break;
+        case Packet_WRITE:
+            infof("writing: size=%zu\n", packet.size);
+            write(writefd, packet.buf, packet.size);
+            break;
+        case Packet_WRITE_AND_REPEAT:
+            infof("writing and repeating: %zu\n", packet.newline_loc+1);
+            write(writefd, packet.buf, packet.newline_loc+1);
+            if (!send_file_to_client(client_socket, writefd)) {
+                pthread_mutex_unlock(p->mutex);
+                errorf("Failed to send packet to client\n");
+                goto cleanup_malloc;
+            };
+            infof("writing and repeating: %zu\n", packet.size-packet.newline_loc-1);
+            write(writefd, packet.buf+packet.newline_loc+1, packet.size-packet.newline_loc-1);
+            break;
+        case Packet_KIND_COUNT:
+        default:
+            UNREACHABLE("wrong packet type");
         }
         pthread_mutex_unlock(p->mutex);
+
     }
     ret = ptr;
 
 cleanup_malloc:
-    if (buf != NULL) free(buf);
-    close(cfd);
-    syslog(LOG_USER | LOG_INFO , "Closed connection from %s\n", p->addr);
+    free(buf);
+cleanup_file:
+    close(writefd);
+cleanup_thread:
+    infof("Closed connection from %s\n", p->addr);
     free(p->addr);
     free(p->writefile_path);
     free(p);
-cleanup_file:
-    fclose(writefile);
+    close(client_socket);
     return ret;
 }
 
@@ -160,33 +191,33 @@ void *append_timer(void *ptr)
     struct tm tm;
     char time_string[128];
 
-    FILE *writefile = fopen(p->writefile_path, "w");
-    if (writefile == NULL) {
-        syslog(LOG_USER | LOG_ERR, "fopen failed: %s\n", strerror(errno));
+    int writefd = open(p->writefile_path, O_WRONLY);
+    if (writefd == -1) {
+        errorf("open failed: %s\n", strerror(errno));
         return NULL;
     }
 
     while (!signal_recieved) {
         pthread_mutex_lock(p->mutex);
         if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
-            syslog(LOG_USER | LOG_ERR, "clock_gettime failed: %s\n", strerror(errno));
+            errorf("clock_gettime failed: %s\n", strerror(errno));
             pthread_mutex_unlock(p->mutex);
             return NULL;
         }
 
         if (localtime_r(&ts.tv_sec, &tm) == NULL) {
-            syslog(LOG_USER | LOG_ERR, "trying to get localtime failed: %s\n", strerror(errno));
+            errorf("trying to get localtime failed: %s\n", strerror(errno));
             pthread_mutex_unlock(p->mutex);
             return NULL;
         }
 
-        size_t bytes_written = strftime(time_string, ARR_SIZE(time_string), "timestamp:%A %d %B %Y (%C-%m-%d) %T %Z\n", &tm);
-        write_and_flush_file(time_string, 1, bytes_written, writefile);
+        size_t string_size = strftime(time_string, ARR_SIZE(time_string), "timestamp:%A %d %B %Y (%C-%m-%d) %T %Z\n", &tm);
+        write(writefd, time_string, string_size);
         pthread_mutex_unlock(p->mutex);
         sleep(10);
     }
 
-    fclose(writefile);
+    close(writefd);
 
     return ptr;
 }
@@ -194,7 +225,7 @@ void *append_timer(void *ptr)
 void handler(int signum)
 {
     UNUSED(signum);
-    syslog(LOG_USER | LOG_INFO , "Caught Signal, exiting");
+    infof("Caught Signal, exiting");
     signal_recieved = true;
 }
 
@@ -204,17 +235,17 @@ bool start_signal_blocking_thread(pthread_t *tid, void *(*func)(void*), void *pa
     sigaddset(&sigmask, SIGTERM);
 
     if (pthread_sigmask(SIG_SETMASK, &sigmask, &old_mask) != 0) {
-        syslog(LOG_USER | LOG_ERR, "Failed to set sigmask: %s\n", strerror(errno));
+        errorf("Failed to set sigmask: %s\n", strerror(errno));
         return false;
     }
 
     if (pthread_create(tid, NULL, func, params) != 0) {
-        syslog(LOG_USER | LOG_ERR, "Failed to create thread: %s\n", strerror(errno));
+        errorf("Failed to create thread: %s\n", strerror(errno));
         return false;
     }
 
     if (pthread_sigmask(SIG_SETMASK, &old_mask, NULL) != 0) {
-        syslog(LOG_USER | LOG_ERR, "Failed to set sigmask: %s\n", strerror(errno));
+        errorf("Failed to set sigmask: %s\n", strerror(errno));
         return false;
     }
 
@@ -270,7 +301,7 @@ int run()
         .mutex = &mutex,
     };
     if (!start_signal_blocking_thread(&timer_tid, append_timer, &timer_info)) {
-        syslog(LOG_USER | LOG_ERR, "Starting timer thread failed\n");
+        errorf("Starting timer thread failed\n");
         return 1;
     }
 #endif // USE_AESD_CHAR_DEVICE
@@ -284,7 +315,7 @@ int run()
 
         char addr_ascii[32];
         inet_ntop(AF_INET, &client_addr.sin_addr, addr_ascii, sizeof(addr_ascii));
-        syslog(LOG_USER | LOG_INFO , "Accepted connection from %s\n", addr_ascii);
+        infof("Accepted connection from %s\n", addr_ascii);
 
         pthread_t tid;
         Thread_Info *info = malloc(sizeof(*info));
@@ -292,18 +323,18 @@ int run()
         info->mutex = &mutex;
         info->addr = strdup(addr_ascii);
         if (info->addr == NULL) {
-            syslog(LOG_USER | LOG_ERR, "strdup failed: %s\n", strerror(errno));
+            errorf("strdup failed: %s\n", strerror(errno));
             break;
         }
 
         info->writefile_path = strdup(path);
         if (info->writefile_path == NULL) {
-            syslog(LOG_USER | LOG_ERR, "strdup failed: %s\n", strerror(errno));
+            errorf("strdup failed: %s\n", strerror(errno));
             break;
         }
 
         if (!start_signal_blocking_thread(&tid, handle_connection, info)) {
-            syslog(LOG_USER | LOG_ERR, "Starting thread failed\n");
+            errorf("Starting thread failed\n");
             break;
         }
 
